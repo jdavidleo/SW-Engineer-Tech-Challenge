@@ -1,8 +1,13 @@
 import asyncio
 import time
+import requests
+import httpx
+import json
+from bson import json_util
 from pydicom import Dataset
 from scp import ModalityStoreSCP
 
+API_ENDPOINT = "http://localhost:5000"
 
 class SeriesCollector:
     """A Series Collector is used to build up a list of instances (a DICOM series) as they are received by the modality.
@@ -64,6 +69,13 @@ class SeriesDispatcher:
             # When datasets are received you should collect and process them
             # (e.g. using `asyncio.create_task(self.run_series_collector()`)
             
+            #if dataset stack has data.
+            if(len(self.modality_scp.datasets)>0):
+                print("Modality arrived!")
+                asyncio.create_task(self.run_series_collectors()) #collect data
+            
+            asyncio.create_task(self.dispatch_series_collector()) #dispatch any data that reside in series collector and hasn't been dispatched
+                
             print("Waiting for Modality")
             await asyncio.sleep(0.2)
 
@@ -71,6 +83,13 @@ class SeriesDispatcher:
         """Runs the collection of datasets, which results in the Series Collector being filled.
         """
         # TODO: Get the data from the SCP and start dispatching
+        dataset = self.modality_scp.datasets.pop()#extract 
+        if self.series_collector is None:
+            self.series_collector = SeriesCollector(dataset)
+        else:
+            is_instance = self.series_collector.add_instance(dataset)
+            if not is_instance:
+                self.modality_scp.datasets.append(dataset)
         pass
 
     async def dispatch_series_collector(self) -> None:
@@ -82,6 +101,33 @@ class SeriesDispatcher:
         # NOTE: This is the last given function, you should create more for extracting the information and
         # sending the data to the server
         maximum_wait_time = 1
+        if self.series_collector is None:
+            return
+        if (time.time() - self.series_collector.last_update_time)> maximum_wait_time:
+            if(not self.series_collector.dispatch_started):
+                info = self.extract_info()
+                self.series_collector.dispatch_started=True
+                await self.send_2_server(info)
+                self.series_collector = None
+                self.modality_scp.unread_event=False
+        pass
+
+    def extract_info(self):
+        info = {}
+        info['SeriesInstanceUID']=self.series_collector.series[0].SeriesInstanceUID
+        info['PatientName']=str(self.series_collector.series[0].PatientName)
+        info['PatientID']=self.series_collector.series[0].PatientID
+        info['StudyInstanceUID']=self.series_collector.series[0].StudyInstanceUID
+        info['InstancesInSeries']=len(self.series_collector.series)
+
+        return info
+
+    async def send_2_server(self, info):
+        async with httpx.AsyncClient() as client:
+            r = await client.post(API_ENDPOINT+'/dicom', json = info)
+        #body = json.dumps(info, default=json_util.default)
+        #r = requests.post(API_ENDPOINT+'/dicom', json=info)
+        print("request sent: "+str(r.status_code))
         pass
 
 
